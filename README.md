@@ -25,7 +25,8 @@
 - [Installation](#-installation)
 - [Usage & API Examples](#-usage--api-examples)
 - [Performance & Load Testing](#-performance--load-testing)
-
+- [Engineering Insights & Production Analysis](#-engineering-insights--production-analysis)
+  
 ---
 
 ## Project Overview
@@ -191,59 +192,64 @@ nohup vllm serve "$BASE_MODEL" \
 
 ---
 
+### Step 4: Spin up the vLLM Server
+    BASE_MODEL="unsloth/Qwen2.5-1.5B-Instruct"
+    ADAPTER_PATH="Mo-Abdelfattah/arabic-semantic-chunker-qwen1.5b"
+
+    nohup vllm serve "$BASE_MODEL" \
+      --dtype=half \
+      --gpu-memory-utilization 0.8 \
+      --max-model-len 2048 \
+      --max-lora-rank 64 \
+      --enable-lora \
+      --lora-modules arabic-chunker="$ADAPTER_PATH" \
+      > nohup.out 2>&1 &
+
+---
+
 ## Usage & API Examples
 
 ### Python REST API Call
 
-```python
-import requests
-from transformers import AutoTokenizer
-import json
+    import requests
+    from transformers import AutoTokenizer
+    import json
 
-tokenizer = AutoTokenizer.from_pretrained("unsloth/Qwen2.5-1.5B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained("unsloth/Qwen2.5-1.5B-Instruct")
 
-# Mixed-Language Input Text
-input_text = """
-أسلوب إديسون في العمل كان يعتمد على Trial and Error.
-كان يمتلك فريقًا في مختبره الشهير في Menlo Park.
-رؤيته للكهرباء ارتكزت على التيار المستمر Direct Current (DC).
-"""
+    input_text = "أسلوب إديسون في العمل كان يعتمد على Trial and Error. كان يمتلك فريقًا في مختبره الشهير في Menlo Park."
 
-system_message = (
-    "You are a professional multilingual NLP data parser.\n"
-    "Split the provided text into meaningful, self-contained semantic chunks.\n"
-    "Preserve the original text exactly and respect its language."
-)
+    system_message = (
+        "You are a professional multilingual NLP data parser.\n"
+        "Split the provided text into meaningful, self-contained semantic chunks.\n"
+        "Preserve the original text exactly and respect its language."
+    )
 
-schema_str = '{"properties": {"original_text_length": {"type": "integer"}, "semantic_chunks": {"items": {"type": "string"}, "minItems": 2, "type": "array"}}, "required": ["original_text_length", "semantic_chunks"], "type": "object"}'
+    schema_str = '{"properties": {"original_text_length": {"type": "integer"}, "semantic_chunks": {"items": {"type": "string"}, "minItems": 2, "type": "array"}}, "required": ["original_text_length", "semantic_chunks"], "type": "object"}'
 
-messages = [
-    {"role": "system", "content": system_message},
-    {"role": "user", "content": f"# Input Text:\n{input_text}\n\n# Output Schema:\n{schema_str}\n\n# Output JSON:\n```json\n"}
-]
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": f"# Input Text:\n{input_text}\n\n# Output Schema:\n{schema_str}\n\n# Output JSON:\n```json\n"}
+    ]
 
-prompt = tokenizer.apply_chat_template(
-    messages, tokenize=False, add_generation_prompt=True
-)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-response = requests.post("http://localhost:8000/v1/completions", json={
-    "model": "arabic-chunker",
-    "prompt": prompt,
-    "max_tokens": 1000,
-    "temperature": 0.1
-})
+    response = requests.post("http://localhost:8000/v1/completions", json={
+        "model": "arabic-chunker",
+        "prompt": prompt,
+        "max_tokens": 1000,
+        "temperature": 0.1
+    })
 
-print(response.json()["choices"][0]["text"])
-```
+    print(response.json()["choices"][0]["text"])
 
 **Output:**
 ```json
 {
-  "original_text_length": 198,
+  "original_text_length": 102,
   "semantic_chunks": [
     "أسلوب إديسون في العمل كان يعتمد على Trial and Error.",
-    "كان يمتلك فريقًا في مختبره الشهير في Menlo Park.",
-    "رؤيته للكهرباء ارتكزت على التيار المستمر Direct Current (DC)."
+    "كان يمتلك فريقًا في مختبره الشهير في Menlo Park."
   ]
 }
 ```
@@ -252,17 +258,52 @@ print(response.json()["choices"][0]["text"])
 
 ## Performance & Load Testing
 
-Stress testing was conducted using **Locust** on a Google Colab T4 (15 GB VRAM) instance:
+Stress testing was conducted using **Locust** on a Google Colab T4 GPU (15 GB VRAM)
+running **vLLM** with a production-stable configuration
+(`--max-model-len 2048`, `--gpu-memory-utilization 0.8`).
+
+### Load Test Results
 
 | Metric | Result |
-|---|---|
-| **Concurrent Users** | 5 (Optimized for T4 VRAM limits) |
-| **Test Duration** | 60 Seconds |
-| **Total Processed Tokens** | ~37,000 tokens |
-| **Throughput** | **~393 tokens/sec** |
-| **Failure Rate** | 0.00% |
+| :--- | :--- |
+| **Concurrent Users** | 20 (simulated via Locust) |
+| **Test Duration** | 60 seconds |
+| **Total Requests** | 40 |
+| **Failure Rate** | **0.00%** |
+| **Throughput** | **437.20 tokens/sec** |
+| **GPU KV Cache Usage** | ~3% (significant headroom remaining) |
 
-> **Tuning Note:** For optimal throughput on a single T4 without encountering OOM errors, ensure `--max-model-len 2048` and `--gpu-memory-utilization 0.8` are strictly set.
+### Response Time Percentiles
+
+| Percentile | Latency |
+| :--- | :--- |
+| 50th (Median) | 19.0 s |
+| 75th | 22.0 s |
+| 90th | 24.0 s |
+| 100th (Max) | 26.0 s |
+
+*High per-request latency reflects the input text length used during testing (400–600 Arabic characters per request). vLLM's continuous batching kept GPU utilization stable throughout the test with zero failures across all 20 concurrent users.*
+
+---
+
+<details>
+<summary> <b>Engineering Insights & Production Analysis (Click to expand)</b></summary>
+
+### 1. Schema Adherence & Granularity Evolution
+* **Strict Format Enforcement:** The pre-trained Baseline model failed to respect the structured JSON schema, returning an invalid layout (nested dictionaries `[{"text": "..."}]`) instead of raw strings. Post-SFT, the fine-tuned model achieved **100% schema adherence**, outputting perfectly structured JSON matching the exact required Pydantic schema.
+* **Granularity Control:** The Teacher model (Gemini) chunked text at a coarse paragraph level (generating fewer, larger blocks). Interestingly, the fine-tuned model adapted a much finer, sentence-level granularity. For **Advanced RAG pipelines**, this granular approach is highly optimized as it avoids context dilution and significantly enhances dense vector embedding retrieval matching.
+
+### 2. Dataset Distribution & Overfitting Analysis
+* **Dataset Composition:** Built a distilled dataset of **2,257 total examples** mixed intentionally: ~65% News/Editorial (XLSum), ~25% Encyclopedic (Wikipedia), and ~10% Technical Mixed-Language (Code-Switching) to sustain strong cross-lingual performance.
+* **The Validation Curve Lesson:** Evaluation showed that the lowest Validation Loss was achieved at **Step 800 (Val Loss: 0.867)**. Beyond Step 800, the Training Loss continued to decrease while the Validation Loss stagnated and drifted slightly, signaling classic early-stage overfitting.
+* **Production Deployment Trade-off:** Since checkpoints were saved every 500 steps, `checkpoint-1000` was selected for production serving. The variance in validation loss between step 800 and 1000 was marginal (~0.008), meaning a complete re-train was economically inefficient under free-tier VRAM constraints.
+
+### 3. Mitigating Qwen Chinese Character Leakage
+* **The Issue:** Base Qwen architectures occasionally leak Chinese Unicode tokens during text generation due to native tokenizer vocabulary and pre-training dataset biases.
+* **The Solution:** For standard `transformers` inference pipelines, an active **Logits Processor** was developed to dynamically apply a restrictive mask (`-inf`) over the Chinese Unicode character range (`0x4E00`-`0x9FFF`) during token sampling.
+* **Serving Note:** When deployed via **vLLM** at a low `temperature=0.1` combined with a rigid system prompt, character leakage naturally dropped to **0.00%**, ensuring pristine Arabic and English output text streams without extra runtime parsing overhead.
+
+</details>
 
 ---
 
